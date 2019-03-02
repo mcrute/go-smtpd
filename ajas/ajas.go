@@ -5,7 +5,7 @@ import (
 	"log"
 	"strings"
 
-	"github.com/bradfitz/go-smtpd/smtpd"
+	"github.com/mcrute/go-smtpd/smtpd"
 )
 
 type env struct {
