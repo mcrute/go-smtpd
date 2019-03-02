@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -37,8 +38,7 @@ type Server struct {
 	ReadTimeout  time.Duration // optional read timeout
 	WriteTimeout time.Duration // optional write timeout
 
-	PlainAuth bool        // advertise plain auth (assumes you're on SSL)
-	StartTLS  *tls.Config // advertise STARTTLS and use the given config to upgrade the connection with
+	StartTLS *tls.Config // advertise STARTTLS and use the given config to upgrade the connection with
 
 	// OnNewConnection, if non-nil, is called on new connections.
 	// If it returns non-nil, the connection is closed.
@@ -47,6 +47,8 @@ type Server struct {
 	// OnNewMail must be defined and is called when a new message beings.
 	// (when a MAIL FROM line arrives)
 	OnNewMail func(c Connection, from MailAddress) (Envelope, error)
+
+	OnAuthentication func(c Connection, user string, password string) error
 }
 
 // MailAddress is defined by
@@ -58,6 +60,7 @@ type MailAddress interface {
 // Connection is implemented by the SMTP library and provided to callers
 // customizing their own Servers.
 type Connection interface {
+	IsAuthenticated() bool
 	Addr() net.Addr
 	Close() error // to force-close a connection
 }
@@ -148,8 +151,9 @@ type session struct {
 
 	env Envelope // current envelope, or nil
 
-	helloType string
-	helloHost string
+	helloType     string
+	helloHost     string
+	authenticated string
 }
 
 func (srv *Server) newSession(rwc net.Conn) (s *session, err error) {
@@ -160,6 +164,10 @@ func (srv *Server) newSession(rwc net.Conn) (s *session, err error) {
 		bw:  bufio.NewWriter(rwc),
 	}
 	return
+}
+
+func (s *session) IsAuthenticated() bool {
+	return s.authenticated != ""
 }
 
 func (s *session) errorf(format string, args ...interface{}) {
@@ -238,6 +246,9 @@ func (s *session) serve() {
 		case "NOOP":
 			s.sendlinef("250 2.0.0 OK")
 		case "MAIL":
+			if !s.validateAuth() {
+				return
+			}
 			arg := line.Arg() // "From:<foo@bar.com>"
 			m := mailFromRE.FindStringSubmatch(arg)
 			if m == nil {
@@ -247,8 +258,16 @@ func (s *session) serve() {
 			}
 			s.handleMailFrom(m[1])
 		case "RCPT":
+			if !s.validateAuth() {
+				return
+			}
 			s.handleRcpt(line)
+		case "AUTH":
+			s.handleAuth(line)
 		case "DATA":
+			if !s.validateAuth() {
+				return
+			}
 			s.handleData()
 		default:
 			log.Printf("Client: %q, verhb: %q", line, line.Verb())
@@ -274,7 +293,7 @@ func (s *session) handleHello(greeting, host string) {
 	s.helloHost = host
 	fmt.Fprintf(s.bw, "250-%s\r\n", s.srv.hostname())
 	extensions := []string{}
-	if s.srv.PlainAuth {
+	if s.srv.OnAuthentication != nil {
 		extensions = append(extensions, "250-AUTH PLAIN")
 	}
 	if s.srv.StartTLS != nil {
@@ -289,6 +308,65 @@ func (s *session) handleHello(greeting, host string) {
 		fmt.Fprintf(s.bw, "%s\r\n", ext)
 	}
 	s.bw.Flush()
+}
+
+func (s *session) handleAuth(line cmdLine) {
+	ah := s.srv.OnAuthentication
+	if ah == nil {
+		log.Printf("smtp: Server.OnAuthentication is nil; rejecting AUTH")
+		s.sendlinef("502 5.5.2 Error: command not recognized")
+		return
+	}
+
+	if ah != nil && s.IsAuthenticated() {
+		log.Printf("smtp: invalid second AUTH on connection")
+		s.sendlinef("503 5.5.1 Error: unable to AUTH more than once")
+		return
+	}
+
+	p := strings.Split(line.Arg(), " ")
+	if len(p) != 2 && p[0] != "PLAIN" {
+		log.Printf("smtp: invalid AUTH argument format")
+		s.sendlinef("502 5.5.2 Error: command not recognized")
+		return
+	}
+
+	c, err := base64.StdEncoding.DecodeString(p[1])
+	if err != nil {
+		log.Printf("smtp: error decoding credentials %v", err)
+		s.sendlinef("535 5.7.8 Authentication credentials invalid")
+		return
+	}
+
+	cp := bytes.Split(c, []byte{0})
+	if len(cp) != 3 {
+		log.Printf("smtp: invalid decoded username and password")
+		s.sendlinef("535 5.7.8 Authentication credentials invalid")
+		return
+	}
+
+	user := string(cp[1])
+	if err := ah(s, user, string(cp[2])); err != nil {
+		log.Printf("smtp: authentication failed: %v", err)
+		s.sendlinef("535 5.7.8 Authentication credentials invalid")
+		return
+	}
+
+	s.authenticated = user
+	log.Printf("smtp: successfully authenticated %s", user)
+	s.sendlinef("235 2.7.0 Authentication Succeeded")
+}
+
+func (s *session) validateAuth() bool {
+	if s.srv.OnAuthentication == nil {
+		return true
+	}
+	if s.srv.OnAuthentication != nil && !s.IsAuthenticated() {
+		log.Printf("smtp: authentication required but session not authenticated; rejecting")
+		s.sendlinef("530 5.7.0  Authentication required")
+		return false
+	}
+	return true
 }
 
 func (s *session) handleMailFrom(email string) {
